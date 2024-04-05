@@ -2,7 +2,7 @@ import random
 from policies.policy import Policy
 
 class RandomPolicy(Policy):
-    def __init__(self, charge_probability=0.5):
+    def __init__(self, charge_probability=0.9):
         """
         Constructor for the RandomPolicy.
 
