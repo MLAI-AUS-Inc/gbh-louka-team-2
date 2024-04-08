@@ -12,7 +12,7 @@ from environment import BatteryEnv, PRICE_KEY, TIMESTAMP_KEY
 from plotting import plot_results
 
 def float_or_none(value):
-    if value.lower() == 'none':
+    if value.lower() == 'none': # OOOOOPS
         return None
     try:
         return float(value)
