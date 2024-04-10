@@ -1,167 +1,145 @@
-import time
-import argparse
-import os
-import random
+"""
+This file contains the core functionality for the battery simulation environment and its interaction with the NEM.
+It provides a realistic representation of the NEM's operations and the battery's role within it.
+Contestants will use this environment to develop and test their bidding strategies.
+
+Units used in this file:
+- Power: kilowatts (kW)
+- Energy: kilowatt-hours (kWh)
+- Time: minutes (min)
+- Price: dollars per kilowatt-hour ($/kWh)
+"""
+
 import pandas as pd
-from datetime import datetime
 import numpy as np
-import json
+from collections import deque
+from typing import Tuple
 
-from policies import policy_classes
-from environment import BatteryEnv, PRICE_KEY, TIMESTAMP_KEY
-from plotting import plot_results
+INTERVAL_DURATION = 5  # Duration of each dispatch interval in minutes
+PRICE_KEY = 'price'
+TIMESTAMP_KEY = 'timestamp'
 
-def float_or_none(value):
-    if value.lower() == 'none': # OOOOOPS
-        return None
-    try:
-        return float(value)
-    except ValueError:
-        raise argparse.ArgumentTypeError(f"{value} is not a float or 'None'")
+def kWh_to_kW(kWh: float) -> float:
+    """
+    Convert energy in kilowatt-hours (kWh) to power in kilowatts (kW).
 
+    :param kWh: Energy in kilowatt-hours (kWh).
+    :return: Power in kilowatts (kW).
+    """
+    return kWh / (INTERVAL_DURATION / 60)
 
-def load_config(file_path):
-    with open(file_path, 'r') as file:
-        return json.load(file)['policy']
+def kW_to_kWh(kWh: float) -> float:
+    """
+    Convert energy in kilowatt-hours (kWh) to power in kilowatts (kW).
 
-def set_seed(seed):
-    random.seed(seed)
-    np.random.seed(seed)
+    :param kWh: Energy in kilowatt-hours (kWh).
+    :return: Power in kilowatts (kW).
+    """
+    return kWh * (INTERVAL_DURATION / 60)
 
-def run_down_battery(battery_environment: BatteryEnv, market_prices):
-    last_day_prices = market_prices[-288:]
-    assumed_rundown_price = np.mean(last_day_prices)
-    rundown_profits = []
+class Battery:
+    def __init__(self, capacity_kWh: float, max_charge_rate_kW: float, initial_charge_kWh: float):
+        self.capacity_kWh = capacity_kWh
+        self.initial_charge_kWh = initial_charge_kWh
+        self.max_charge_rate_kW = max_charge_rate_kW
+        self._state_of_charge_kWh = min(self.initial_charge_kWh, self.capacity_kWh)
+
+    def reset(self):
+        self._state_of_charge_kWh = min(self.initial_charge_kWh, self.capacity_kWh)
     
-    while battery_environment.battery.state_of_charge_kWh > 0:
-        kWh_removed = battery_environment.battery.discharge_at(battery_environment.battery.max_charge_rate_kW)
-        rundown_profits.append(battery_environment.kWh_to_profit(kWh_removed, assumed_rundown_price))
+    def charge_at(self, kW: float) -> float:
+        kW = min(kW, self.max_charge_rate_kW)
+        kWh_to_add = kW_to_kWh(kW) 
+        kWh_to_add = min(kWh_to_add, self.capacity_kWh - self._state_of_charge_kWh)
+        self._state_of_charge_kWh += kWh_to_add
+        return kWh_to_add
 
-    return rundown_profits
+    def discharge_at(self, kW: float) -> float:
+        kW = min(kW, self.max_charge_rate_kW)
+        kW_to_remove = kW_to_kWh(kW)
+        kW_to_remove = min(kW_to_remove, self._state_of_charge_kWh)
+        self._state_of_charge_kWh = max(self._state_of_charge_kWh - kW_to_remove, 0)
+        return kW_to_remove
 
-def run_trial(battery_environment: BatteryEnv, policy):
-    profits, socs, market_prices, battery_actions, solar_actions, pv_inputs, timestamps = [], [], [], [], [], [], []
-
-    external_state, internal_state = battery_environment.initial_state()
-    while True:
-        pv_power = float(external_state["pv_power"])
-        solar_kW_to_battery, charge_kW = policy.act(external_state, internal_state)
-
-        market_prices.append(external_state[PRICE_KEY])
-        timestamps.append(external_state[TIMESTAMP_KEY])
-        battery_actions.append(charge_kW)
-        solar_actions.append(solar_kW_to_battery)
-        pv_inputs.append(pv_power)
-
-        external_state, internal_state = battery_environment.step(charge_kW, solar_kW_to_battery, pv_power)
-
-        profits.append(internal_state['total_profit'])
-        socs.append(internal_state['battery_soc'])
-
-        if external_state is None:
-            break
+    @property
+    def state_of_charge_kWh(self) -> float:
+        return self._state_of_charge_kWh
 
 
-    rundown_profits = run_down_battery(battery_environment, market_prices)
+class BatteryEnv:
+    """
+    Environment for simulating battery operation in the National Electricity Market (NEM) context.
+    """
+    def __init__(self, data, capacity_kWh: float = 13, max_charge_rate_kW: float = 5, initial_charge_kWh: float = 7.5, initial_profit: float = 0.0):
+        self.battery = Battery(capacity_kWh, max_charge_rate_kW, initial_charge_kWh)
+        self.market_data = data
+        self.total_profit = initial_profit
+        self.current_step = 0
+        self.episode_length = len(self.market_data)
 
-    return {
-        'profits': profits,
-        'socs': socs,
-        'market_prices': market_prices,
-        'actions': battery_actions,
-        'solar_actions': solar_actions,
-        'pv_inputs': pv_inputs,
-        'final_soc': socs[-1],
-        'rundown_profit_deltas': rundown_profits,
-        'timestamps': timestamps
-    }
+    def initial_state(self):
+        assert self.current_step == 0
 
-def parse_parameters(params_list):
-    params = {}
-    for item in params_list:
-        key, value = item.split('=')
-        params[key] = eval(value)
-    return params
+        return self.market_data.iloc[self.current_step], self.get_info(0)
 
-def perform_eval(args):
-    start = time.time()
+    def step(self, charge_kW: float, solar_kW_to_battery:int, total_solar_kW:int) -> Tuple[pd.Series, dict]:
+        if self.current_step >= len(self.market_data):
+            return None, None
+        market_price_mWh = self.market_data.iloc[self.current_step][PRICE_KEY]
 
-    if args.class_name:
-        policy_config = {'class_name': args.class_name, 'parameters': parse_parameters(args.param)}
-    else:
-        policy_config = load_config('bot/config.json')
+        kW_currently_charging, solar_profit_delta = self.process_solar(solar_kW_to_battery, total_solar_kW, market_price_mWh)
 
-    policy_class = policy_classes[policy_config['class_name']]
-    
-    external_states = pd.read_csv(args.data)
-    if args.output_file:
-        output_file = args.output_file
-    else:
-        results_dir = 'bot/results'
-        os.makedirs(results_dir, exist_ok=True)
-        output_file = os.path.join(results_dir, f'{datetime.now().strftime("%Y%m%d_%H%M%S")}_{policy_config["class_name"]}.json')
+        max_charge_kW = self.battery.max_charge_rate_kW - kW_currently_charging
+        battery_profit_delta = self.charge_discharge(min(charge_kW, max_charge_kW), market_price_mWh)
+        
+        external_state = self.get_info(battery_profit_delta + solar_profit_delta)
 
-    initial_profit = args.initial_profit if 'initial_profit' in args and args.initial_profit is not None else 0
-    initial_soc = args.initial_soc if 'initial_soc' in args and args.initial_profit is not None else 7.5
+        self.current_step += 1
+        if self.current_step >= len(self.market_data):
+            return None, external_state
 
-    set_seed(args.seed)
-    start_step = args.present_index
+        return self.market_data.iloc[self.current_step], external_state
 
-    historical_data = external_states.iloc[:start_step]
-    future_data = external_states.iloc[start_step:]
+    def process_solar(self, solar_kW_to_battery: int, total_solar_kW: int, market_price_mWh:int) -> float:
+        solar_kW_to_battery = max(0, min(total_solar_kW, solar_kW_to_battery))
 
-    battery_environment = BatteryEnv(
-        data=future_data,
-        initial_charge_kWh=initial_soc,
-        initial_profit=initial_profit
-    )
+        kWh_charged = self.battery.charge_at(solar_kW_to_battery)
+        kW_charging = kWh_to_kW(kWh_charged)
+        energy_to_grid_kWh = kW_to_kWh(total_solar_kW) - kWh_charged
+        profit = self.kWh_to_profit(energy_to_grid_kWh, market_price_mWh)
 
-    policy = policy_class(**policy_config.get('parameters', {}))
-    policy.load_historical(historical_data)
-    trial_data = run_trial(battery_environment, policy)
+        return kW_charging, profit
 
-    total_profits = trial_data['profits']
-    rundown_profit_deltas = trial_data['rundown_profit_deltas']
+    def kWh_to_profit(self, energy_removed: float, spot_price_mWh: float) -> float:
+        non_tarif_profit = round(energy_removed * spot_price_mWh / 1000, 4)
 
-    mean_profit = float(np.mean(total_profits))
-    std_profit = float(np.std(total_profits))
+        if energy_removed > 0:
+            return non_tarif_profit * 0.9
+        
+        return non_tarif_profit * 1.1
 
-    mean_combined_profit = total_profits[-1] + np.sum(rundown_profit_deltas)
+    def charge_discharge(self, charge_kW: float, spot_price_mWh: float) -> float:
+        if charge_kW > 0:
+            kWh_to_battery = self.battery.charge_at(charge_kW)
+            return -self.kWh_to_profit(kWh_to_battery, spot_price_mWh) 
+        elif charge_kW < 0:
+            kWh_to_grid = self.battery.discharge_at(-charge_kW)
+            return self.kWh_to_profit(kWh_to_grid, spot_price_mWh)
+        return 0
 
-    outcome = {
-        'class_name': policy_config['class_name'],
-        'parameters': policy_config.get('parameters', {}),
-        'mean_profit': mean_profit,
-        'std_profit': std_profit,
-        'score': mean_combined_profit,
-        'main_trial': trial_data,
-        'seconds_elapsed': time.time() - start 
-    }
+    def get_info(self, profit_delta: float = 0) -> dict:
+        """
+        Return a dictionary containing relevant information for the agent.
 
-    print(f'Average profit ($): {mean_profit:.2f} ± {std_profit:.2f}')
-    print(f'Average profit inc rundown ($): {mean_combined_profit:.2f}')
-
-    with open(output_file, 'w') as file:
-        json.dump(outcome, file, indent=2)
-
-    if args.plot:
-        plot_results(trial_data['profits'], trial_data['market_prices'], trial_data['socs'], trial_data['actions'])
-
-def main():
-    parser = argparse.ArgumentParser(description='Evaluate a single energy market strategy.')
-    parser.add_argument('--plot', action='store_true', help='Plot the results of the main trial.', default=False)
-    parser.add_argument('--present_index', type=int, default=0, help='Index to split the historical data from the data which will be used for the evaluation.')
-    parser.add_argument('--seed', type=int, default=42, help='Seed for randomness')
-    parser.add_argument('--data', type=str, default='bot/data/april15-may7_2023.csv', help='Path to the market data csv file')
-    parser.add_argument('--class_name', type=str, help='Policy class name. If not provided, the config.json policy will be used.')
-    parser.add_argument('--output_file', type=str, help='File to save all the submission outputs to.', default=None)
-    parser.add_argument('--param', action='append', help='Policy parameters as key=value pairs', default=[])
-    parser.add_argument('--initial_soc', type=float_or_none, help='Initial state of charge of the battery in kWh', default=None)
-    parser.add_argument('--initial_profit', type=float_or_none, help='Initial profit of the battery in $', default=None)
-
-    args = parser.parse_args()
-
-    perform_eval(args)
-
-if __name__ == '__main__':
-    main()
+        :param profit_delta: The change in profit from the last action (default: 0).
+        :return: A dictionary containing information about the current state of the environment.
+        """
+        self.total_profit += profit_delta
+        remaining_steps = len(self.market_data) - self.current_step - 1
+        return {
+            'total_profit': self.total_profit,
+            'profit_delta': profit_delta,
+            'battery_soc': self.battery.state_of_charge_kWh,
+            'max_charge_rate': self.battery.max_charge_rate_kW,
+            'remaining_steps': remaining_steps
+        }
