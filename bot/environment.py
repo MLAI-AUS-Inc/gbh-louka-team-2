@@ -111,7 +111,12 @@ class BatteryEnv:
         return kW_charging, profit
 
     def kWh_to_profit(self, energy_removed: float, spot_price_mWh: float) -> float:
-        return round(energy_removed * spot_price_mWh / 1000, 4)
+        non_tarif_profit = round(energy_removed * spot_price_mWh / 1000, 4)
+
+        if energy_removed > 0:
+            return non_tarif_profit * 0.9
+        
+        return non_tarif_profit * 1.1
 
     def charge_discharge(self, charge_kW: float, spot_price_mWh: float) -> float:
         if charge_kW > 0:
