@@ -102,18 +102,13 @@ class BatteryEnv:
         return self.market_data.iloc[self.current_step], external_state
 
     def with_tariff(self, profit, is_export, timestamp):
-        print('timestamp', timestamp)
         if isinstance(timestamp, str):
             # timestamp is a UTC string make timestamp a pd.timestamp object then convert to EXACTLY +10, not dependent on any other timezone
             utc_timestamp = pd.Timestamp(timestamp, tz='UTC')
             plus_10 = pd.Timedelta(hours=10)
             timestamp = utc_timestamp + plus_10 
 
-        print('timestamp', timestamp)
-
         is_peak = timestamp.hour >= 17 and timestamp.hour < 21
-
-        print('is_peak', is_peak)
 
         if is_export:
             if is_peak:
