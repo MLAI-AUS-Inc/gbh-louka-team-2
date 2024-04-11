@@ -86,11 +86,12 @@ class BatteryEnv:
         if self.current_step >= len(self.market_data):
             return None, None
         market_price_mWh = self.market_data.iloc[self.current_step][PRICE_KEY]
+        timestamp = self.market_data.iloc[self.current_step][TIMESTAMP_KEY]
 
-        kW_currently_charging, solar_profit_delta = self.process_solar(solar_kW_to_battery, total_solar_kW, market_price_mWh)
+        kW_currently_charging, solar_profit_delta = self.process_solar(solar_kW_to_battery, total_solar_kW, market_price_mWh, timestamp)
 
         max_charge_kW = self.battery.max_charge_rate_kW - kW_currently_charging
-        battery_profit_delta = self.charge_discharge(min(charge_kW, max_charge_kW), market_price_mWh)
+        battery_profit_delta = self.charge_discharge(min(charge_kW, max_charge_kW), market_price_mWh, timestamp)
         
         external_state = self.get_info(battery_profit_delta + solar_profit_delta)
 
@@ -100,31 +101,52 @@ class BatteryEnv:
 
         return self.market_data.iloc[self.current_step], external_state
 
-    def process_solar(self, solar_kW_to_battery: int, total_solar_kW: int, market_price_mWh:int) -> float:
+    def with_tariff(self, profit, is_export, timestamp):
+        print('timestamp', timestamp)
+        if isinstance(timestamp, str):
+            # timestamp is a UTC string make timestamp a pd.timestamp object then convert to EXACTLY +10, not dependent on any other timezone
+            utc_timestamp = pd.Timestamp(timestamp, tz='UTC')
+            plus_10 = pd.Timedelta(hours=10)
+            timestamp = utc_timestamp + plus_10 
+
+        print('timestamp', timestamp)
+
+        is_peak = timestamp.hour >= 17 and timestamp.hour < 21
+
+        print('is_peak', is_peak)
+
+        if is_export:
+            if is_peak:
+                return profit + abs(profit * 0.30)
+            return profit - abs(profit * 0.15)
+        
+        if is_peak:
+            return profit - abs(profit * 0.40)
+        return profit - abs(profit * 0.05)
+
+    def process_solar(self, solar_kW_to_battery: int, total_solar_kW: int, market_price_mWh:int, timestamp) -> float:
         solar_kW_to_battery = max(0, min(total_solar_kW, solar_kW_to_battery))
 
         kWh_charged = self.battery.charge_at(solar_kW_to_battery)
         kW_charging = kWh_to_kW(kWh_charged)
         energy_to_grid_kWh = kW_to_kWh(total_solar_kW) - kWh_charged
         profit = self.kWh_to_profit(energy_to_grid_kWh, market_price_mWh)
+        profit = self.with_tariff(profit, True, timestamp)
 
         return kW_charging, profit
 
     def kWh_to_profit(self, energy_removed: float, spot_price_mWh: float) -> float:
-        non_tarif_profit = round(energy_removed * spot_price_mWh / 1000, 4)
+        return round(energy_removed * spot_price_mWh / 1000, 4)
 
-        if energy_removed > 0:
-            return non_tarif_profit * 0.9
-        
-        return non_tarif_profit * 1.1
-
-    def charge_discharge(self, charge_kW: float, spot_price_mWh: float) -> float:
+    def charge_discharge(self, charge_kW: float, spot_price_mWh: float, timestamp) -> float:
         if charge_kW > 0:
             kWh_to_battery = self.battery.charge_at(charge_kW)
-            return -self.kWh_to_profit(kWh_to_battery, spot_price_mWh) 
+            profit = -self.kWh_to_profit(kWh_to_battery, spot_price_mWh)
+            return self.with_tariff(profit, False, timestamp)
         elif charge_kW < 0:
             kWh_to_grid = self.battery.discharge_at(-charge_kW)
-            return self.kWh_to_profit(kWh_to_grid, spot_price_mWh)
+            profit = self.kWh_to_profit(kWh_to_grid, spot_price_mWh)
+            return self.with_tariff(profit, True, timestamp)
         return 0
 
     def get_info(self, profit_delta: float = 0) -> dict:
